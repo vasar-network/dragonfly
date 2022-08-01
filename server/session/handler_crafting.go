@@ -6,6 +6,7 @@ import (
 	"github.com/df-mc/dragonfly/server/item/creative"
 	"github.com/df-mc/dragonfly/server/item/inventory"
 	"github.com/df-mc/dragonfly/server/item/recipe"
+	"github.com/df-mc/dragonfly/server/world"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"golang.org/x/exp/slices"
 )
@@ -21,6 +22,9 @@ func (h *ItemStackRequestHandler) handleCraft(a *protocol.CraftRecipeStackReques
 	if !shaped && !shapeless {
 		return fmt.Errorf("recipe with network id %v is not a shaped or shapeless recipe", a.RecipeNetworkID)
 	}
+	if craft.Block() != "crafting_table" {
+		return fmt.Errorf("recipe with network id %v is not a crafting table recipe", a.RecipeNetworkID)
+	}
 
 	size := s.craftingSize()
 	offset := s.craftingOffset()
@@ -33,29 +37,19 @@ func (h *ItemStackRequestHandler) handleCraft(a *protocol.CraftRecipeStackReques
 				continue
 			}
 			has, _ := s.ui.Item(int(slot))
-			_, variants := expected.Value("variants")
 			if has.Empty() != expected.Empty() || has.Count() < expected.Count() {
 				// We can't process this item, as it's not a part of the recipe.
 				continue
 			}
-			if !variants && !has.Comparable(expected) {
-				// Not the same item without accounting for variants.
+			if !matchingStacks(has, expected) {
+				// Not the same item.
 				continue
-			}
-			if variants {
-				nameOne, _ := has.Item().EncodeItem()
-				nameTwo, _ := expected.Item().EncodeItem()
-				if nameOne != nameTwo {
-					// Not the same item even when accounting for variants.
-					continue
-				}
 			}
 			processed, consumed[slot-offset] = true, true
 			st := has.Grow(-expected.Count())
 			h.setItemInSlot(protocol.StackRequestSlotInfo{
-				ContainerID:    containerCraftingGrid,
-				Slot:           byte(slot),
-				StackNetworkID: item_id(st),
+				ContainerID: containerCraftingGrid,
+				Slot:        byte(slot),
 			}, st, s)
 			break
 		}
@@ -66,9 +60,8 @@ func (h *ItemStackRequestHandler) handleCraft(a *protocol.CraftRecipeStackReques
 
 	output := craft.Output()
 	h.setItemInSlot(protocol.StackRequestSlotInfo{
-		ContainerID:    containerCraftingGrid,
-		Slot:           craftingResult,
-		StackNetworkID: item_id(output[0]),
+		ContainerID: containerCraftingGrid,
+		Slot:        craftingResult,
 	}, output[0], s)
 	return nil
 }
@@ -84,6 +77,9 @@ func (h *ItemStackRequestHandler) handleAutoCraft(a *protocol.AutoCraftRecipeSta
 	if !shaped && !shapeless {
 		return fmt.Errorf("recipe with network id %v is not a shaped or shapeless recipe", a.RecipeNetworkID)
 	}
+	if craft.Block() != "crafting_table" {
+		return fmt.Errorf("recipe with network id %v is not a crafting table recipe", a.RecipeNetworkID)
+	}
 
 	input := make([]item.Stack, 0, len(craft.Input()))
 	for _, i := range craft.Input() {
@@ -97,14 +93,8 @@ func (h *ItemStackRequestHandler) handleAutoCraft(a *protocol.AutoCraftRecipeSta
 			continue
 		}
 
-		_, variants := i.Value("variants")
 		if ind := slices.IndexFunc(expectancies, func(st item.Stack) bool {
-			if variants {
-				nameOne, _ := st.Item().EncodeItem()
-				nameTwo, _ := i.Item().EncodeItem()
-				return nameOne == nameTwo
-			}
-			return st.Comparable(i)
+			return matchingStacks(st, i)
 		}); ind >= 0 {
 			i = i.Grow(expectancies[ind].Count())
 			expectancies = slices.Delete(expectancies, ind, ind+1)
@@ -113,24 +103,15 @@ func (h *ItemStackRequestHandler) handleAutoCraft(a *protocol.AutoCraftRecipeSta
 	}
 
 	for _, expected := range expectancies {
-		_, variants := expected.Value("variants")
 		for id, inv := range map[byte]*inventory.Inventory{containerCraftingGrid: s.ui, containerFullInventory: s.inv} {
 			for slot, has := range inv.Slots() {
 				if has.Empty() {
 					// We don't have this item, skip it.
 					continue
 				}
-				if !variants && !has.Comparable(expected) {
-					// Not the same item without accounting for variants.
+				if !matchingStacks(has, expected) {
+					// Not the same item.
 					continue
-				}
-				if variants {
-					nameOne, _ := has.Item().EncodeItem()
-					nameTwo, _ := expected.Item().EncodeItem()
-					if nameOne != nameTwo {
-						// Not the same item even when accounting for variants.
-						continue
-					}
 				}
 
 				remaining, removal := expected.Count(), has.Count()
@@ -186,4 +167,45 @@ func (h *ItemStackRequestHandler) handleCreativeCraft(a *protocol.CraftCreativeS
 		Slot:        craftingResult,
 	}, it, s)
 	return nil
+}
+
+// craftingSize gets the crafting size based on the opened container ID.
+func (s *Session) craftingSize() uint32 {
+	if s.openedContainerID.Load() == 1 {
+		return craftingGridSizeLarge
+	}
+	return craftingGridSizeSmall
+}
+
+// craftingOffset gets the crafting offset based on the opened container ID.
+func (s *Session) craftingOffset() uint32 {
+	if s.openedContainerID.Load() == 1 {
+		return craftingGridLargeOffset
+	}
+	return craftingGridSmallOffset
+}
+
+// duplicateStack duplicates an item.Stack with the new item type given.
+func duplicateStack(input item.Stack, newType world.Item) item.Stack {
+	outputStack := item.NewStack(newType, input.Count()).
+		Damage(input.MaxDurability() - input.Durability()).
+		WithCustomName(input.CustomName()).
+		WithLore(input.Lore()...).
+		WithEnchantments(input.Enchantments()...).
+		WithAnvilCost(input.AnvilCost())
+	for k, v := range input.Values() {
+		outputStack = outputStack.WithValue(k, v)
+	}
+	return outputStack
+}
+
+// matchingStacks returns true if the two stacks are the same in a crafting scenario.
+func matchingStacks(has, expected item.Stack) bool {
+	_, variants := expected.Value("variants")
+	if !variants {
+		return has.Comparable(expected)
+	}
+	nameOne, _ := has.Item().EncodeItem()
+	nameTwo, _ := expected.Item().EncodeItem()
+	return nameOne == nameTwo
 }

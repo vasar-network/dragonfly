@@ -28,6 +28,7 @@ import (
 	"github.com/df-mc/dragonfly/server/world/sound"
 	"github.com/go-gl/mathgl/mgl64"
 	"github.com/google/uuid"
+	"golang.org/x/exp/maps"
 	"golang.org/x/text/language"
 	"math"
 	"math/rand"
@@ -59,9 +60,9 @@ type Player struct {
 	// h holds the current Handler of the player. It may be changed at any time by calling the Handle method.
 	h atomic.Value[Handler]
 
-	inv, offHand *inventory.Inventory
-	armour       *inventory.Armour
-	heldSlot     *atomic.Uint32
+	inv, offHand, enderChest *inventory.Inventory
+	armour                   *inventory.Armour
+	heldSlot                 *atomic.Uint32
 
 	sneaking, sprinting, swimming, flying,
 	invisible, immobile, onGround, usingItem atomic.Bool
@@ -75,7 +76,7 @@ type Player struct {
 	maxAirSupplyTicks atomic.Int64
 
 	cooldownMu sync.Mutex
-	cooldowns  map[itemHash]time.Time
+	cooldowns  map[string]time.Time
 	// lastTickedWorld holds the world that the player was in, in the last tick.
 	lastTickedWorld *world.World
 
@@ -86,6 +87,8 @@ type Player struct {
 
 	lastXPPickup atomic.Value[time.Time]
 	immunity     atomic.Value[time.Time]
+
+	enchantSeed atomic.Int64
 
 	mc *entity.MovementComputer
 
@@ -109,11 +112,12 @@ func New(name string, skin skin.Skin, pos mgl64.Vec3) *Player {
 				p.broadcastItems(slot, item)
 			}
 		}),
+		enderChest:        inventory.New(27, nil),
 		uuid:              uuid.New(),
 		offHand:           inventory.New(1, p.broadcastItems),
 		armour:            inventory.NewArmour(p.broadcastArmour),
 		hunger:            newHungerManager(),
-		health:            entity.NewHealthManager(),
+		health:            entity.NewHealthManager(20, 20),
 		experience:        entity.NewExperienceManager(),
 		effects:           entity.NewEffectManager(),
 		gameMode:          *atomic.NewValue[world.GameMode](world.GameModeSurvival),
@@ -127,10 +131,11 @@ func New(name string, skin skin.Skin, pos mgl64.Vec3) *Player {
 		breathing:         true,
 		airSupplyTicks:    *atomic.NewInt64(300),
 		maxAirSupplyTicks: *atomic.NewInt64(300),
+		enchantSeed:       *atomic.NewInt64(rand.Int63()),
 		scale:             *atomic.NewFloat64(1),
 		immunity:          *atomic.NewValue(time.Now()),
 		pos:               *atomic.NewValue(pos),
-		cooldowns:         make(map[itemHash]time.Time),
+		cooldowns:         make(map[string]time.Time),
 		mc:                &entity.MovementComputer{Gravity: 0.06, Drag: 0.02, DragBeforeGravity: true},
 	}
 	return p
@@ -144,7 +149,7 @@ func New(name string, skin skin.Skin, pos mgl64.Vec3) *Player {
 func NewWithSession(name, xuid string, uuid uuid.UUID, skin skin.Skin, s *session.Session, pos mgl64.Vec3, data *Data) *Player {
 	p := New(name, skin, pos)
 	p.s, p.uuid, p.xuid, p.skin = *atomic.NewValue(s), uuid, xuid, *atomic.NewValue(skin)
-	p.inv, p.offHand, p.armour, p.heldSlot = s.HandleInventories()
+	p.inv, p.offHand, p.enderChest, p.armour, p.heldSlot = s.HandleInventories()
 	p.locale, _ = language.Parse(strings.Replace(s.ClientData().LanguageCode, "_", "-", 1))
 	if data != nil {
 		p.load(*data)
@@ -555,10 +560,39 @@ func (p *Player) Hurt(dmg float64, source damage.Source) (float64, bool) {
 	if source.ReducedByArmour() {
 		p.Exhaust(0.1)
 
+		var damageToAttacker int
 		damageToArmour := int(math.Max(math.Floor(dmg/4), 1))
+		thornsArmour := map[int]item.Stack{}
 		for slot, it := range p.armour.Slots() {
 			if _, ok := it.Item().(item.Durable); ok {
+				if e, ok := it.Enchantment(enchantment.Thorns{}); ok && rand.Float64() < float64(e.Level())*0.15 {
+					damageToArmour++
+					thornsArmour[slot] = it
+					if e.Level() > 10 {
+						damageToAttacker += e.Level() - 10
+					} else {
+						damageToAttacker += 1 + rand.Intn(4)
+					}
+				}
 				_ = p.armour.Inventory().SetItem(slot, p.damageItem(it, damageToArmour))
+			}
+		}
+
+		if length := len(thornsArmour); length > 0 {
+			slot := maps.Keys(thornsArmour)[rand.Intn(length)]
+			it := thornsArmour[slot]
+
+			_ = p.armour.Inventory().SetItem(slot, p.damageItem(it, 2))
+			if damageToAttacker > 0 {
+				var attacker world.Entity
+				if s, ok := source.(damage.SourceEntityAttack); ok {
+					attacker = s.Attacker
+				} else if s, ok := source.(damage.SourceProjectile); ok {
+					attacker = s.Owner
+				}
+				if l, ok := attacker.(entity.Living); ok {
+					l.Hurt(float64(damageToAttacker), damage.SourceThorns{Owner: attacker})
+				}
 			}
 		}
 	}
@@ -595,6 +629,19 @@ func (p *Player) FinalDamageFrom(dmg float64, src damage.Source) float64 {
 				toughness += a.Toughness()
 			}
 		}
+
+		// First calculate the enchantment protection factor and cap it at 25. Then, multiply it by a random percent
+		// and round up. Cap that value at 20, and then subtract it from the damage but multiplied by 0.04.
+		f := p.enchantmentProtectionFactor(src)
+		if f > 25 {
+			f = 25
+		}
+		m := math.Ceil(float64(f) * (float64(rand.Intn(100-50)+50) / 100.0))
+		if m > 20 {
+			m = 20
+		}
+		dmg -= dmg * m * 0.04
+
 		// Armour in Bedrock edition reduces the damage taken by 4% for each effective armour point. Effective
 		// armour point decreases as damage increases, with 1 point lost for every 2 HP of damage. The defense
 		// reduction is decreased by the toughness armor value. Effective armour points will at minimum be 20% of
@@ -605,17 +652,14 @@ func (p *Player) FinalDamageFrom(dmg float64, src damage.Source) float64 {
 		dmg *= effect.Resistance{}.Multiplier(src, res.Level())
 	}
 
-	f := p.enchantmentProtectionFactor(src)
-	if f > 25 {
-		f = 25
-	}
-	m := math.Ceil(float64(f) * (float64(rand.Intn(100-50)+50) / 100.0))
-	if m > 20 {
-		m = 20
-	}
-
-	dmg -= -dmg * m * 0.04
 	return math.Max(dmg, 0)
+}
+
+// Explode ...
+func (p *Player) Explode(explosionPos mgl64.Vec3, impact float64, c block.ExplosionConfig) {
+	diff := p.Position().Sub(explosionPos)
+	p.Hurt(math.Floor((impact*impact+impact)*3.5*c.Size+1), damage.SourceExplosion{})
+	p.knockBack(explosionPos, impact, diff[1]/diff.Len()*impact)
 }
 
 // protectionEnchantment represents an enchantment that can protect the player from damage.
@@ -671,13 +715,19 @@ func (p *Player) KnockBack(src mgl64.Vec3, force, height float64) {
 	if p.Dead() || !p.GameMode().AllowsTakingDamage() {
 		return
 	}
+	p.knockBack(src, force, height)
+}
+
+// knockBack is an unexported function that is used to knock the player back. This function does not check if the player
+// can take damage or not.
+func (p *Player) knockBack(src mgl64.Vec3, force, height float64) {
 	velocity := p.Position().Sub(src)
 	velocity[1] = 0
 
 	velocity = velocity.Normalize().Mul(force)
 	velocity[1] = height
 
-	resistance := 0.0
+	var resistance float64
 	for _, i := range p.armour.Items() {
 		if a, ok := i.Item().(item.Armour); ok {
 			resistance += a.KnockBackResistance()
@@ -1129,6 +1179,12 @@ func (p *Player) SetHeldItems(mainHand, offHand item.Stack) {
 	_ = p.offHand.SetItem(0, offHand)
 }
 
+// EnderChestInventory returns the player's ender chest inventory. Its accessed by the player when opening
+// ender chests anywhere.
+func (p *Player) EnderChestInventory() *inventory.Inventory {
+	return p.enderChest
+}
+
 // SetGameMode sets the game mode of a player. The game mode specifies the way that the player can interact
 // with the world that it is in.
 func (p *Player) SetGameMode(mode world.GameMode) {
@@ -1152,23 +1208,6 @@ func (p *Player) GameMode() world.GameMode {
 	return p.gameMode.Load()
 }
 
-// itemHash is used as a hash for a world.Item.
-type itemHash struct {
-	// Name is the name of the item.
-	Name string
-	// Meta is the item's metadata value.
-	Meta int16
-}
-
-// hashFromItem returns an item hash from an item.
-func hashFromItem(item world.Item) itemHash {
-	name, meta := item.EncodeItem()
-	return itemHash{
-		Name: name,
-		Meta: meta,
-	}
-}
-
 // HasCooldown returns true if the item passed has an active cooldown, meaning it currently cannot be used again. If the
 // world.Item passed is nil, HasCooldown always returns false.
 func (p *Player) HasCooldown(item world.Item) bool {
@@ -1178,13 +1217,13 @@ func (p *Player) HasCooldown(item world.Item) bool {
 	p.cooldownMu.Lock()
 	defer p.cooldownMu.Unlock()
 
-	hash := hashFromItem(item)
-	otherTime, ok := p.cooldowns[hash]
+	name, _ := item.EncodeItem()
+	otherTime, ok := p.cooldowns[name]
 	if !ok {
 		return false
 	}
 	if time.Now().After(otherTime) {
-		delete(p.cooldowns, hash)
+		delete(p.cooldowns, name)
 		return false
 	}
 	return true
@@ -1198,7 +1237,9 @@ func (p *Player) SetCooldown(item world.Item, cooldown time.Duration) {
 	p.cooldownMu.Lock()
 	defer p.cooldownMu.Unlock()
 
-	p.cooldowns[hashFromItem(item)] = time.Now().Add(cooldown)
+	name, _ := item.EncodeItem()
+	p.cooldowns[name] = time.Now().Add(cooldown)
+	p.session().ViewItemCooldown(item, cooldown)
 }
 
 // UseItem uses the item currently held in the player's main hand in the air. Generally, nothing happens,
@@ -1223,14 +1264,16 @@ func (p *Player) UseItem() {
 		p.SetCooldown(it, cd.Cooldown())
 	}
 
-	switch usable := it.(type) {
-	case item.Releasable:
+	if _, ok := it.(item.Releasable); ok {
 		if !p.canRelease() {
 			return
 		}
 		p.usingSince.Store(time.Now().UnixNano())
 		p.usingItem.Store(true)
 		p.updateState()
+	}
+
+	switch usable := it.(type) {
 	case item.Usable:
 		useCtx := p.useContext()
 		if !usable.Use(w, p, useCtx) {
@@ -1364,9 +1407,12 @@ func (p *Player) UseItemOnBlock(pos cube.Pos, face cube.Face, clickPos mgl64.Vec
 		// items, in which case the block will be activated as usual.
 		if !p.Sneaking() || i.Empty() {
 			p.SwingArm()
+
 			// The block was activated: Blocks such as doors must always have precedence over the item being
 			// used.
-			if act.Activate(pos, face, p.World(), p) {
+			if useCtx := p.useContext(); act.Activate(pos, face, p.World(), p, useCtx) {
+				p.SetHeldItems(p.subtractItem(p.damageItem(i, useCtx.Damage), useCtx.CountSub), left)
+				p.addNewItem(useCtx)
 				return
 			}
 		}
@@ -1404,26 +1450,27 @@ func (p *Player) UseItemOnBlock(pos cube.Pos, face cube.Face, clickPos mgl64.Vec
 // UseItemOnEntity uses the item held in the main hand of the player on the entity passed, provided it is
 // within range of the player.
 // If the item held in the main hand of the player does nothing when used on an entity, nothing will happen.
-func (p *Player) UseItemOnEntity(e world.Entity) {
+func (p *Player) UseItemOnEntity(e world.Entity) bool {
 	if !p.canReach(e.Position()) {
-		return
+		return false
 	}
 	ctx := event.C()
 	if p.Handler().HandleItemUseOnEntity(ctx, e); ctx.Cancelled() {
-		return
+		return false
 	}
 	i, left := p.HeldItems()
 	usable, ok := i.Item().(item.UsableOnEntity)
 	if !ok {
-		return
+		return true
 	}
 	useCtx := p.useContext()
 	if !usable.UseOnEntity(e, e.World(), p, useCtx) {
-		return
+		return true
 	}
 	p.SwingArm()
 	p.SetHeldItems(p.subtractItem(p.damageItem(i, useCtx.Damage), useCtx.CountSub), left)
 	p.addNewItem(useCtx)
+	return true
 }
 
 // AttackEntity uses the item held in the main hand of the player to attack the entity passed, provided it is
@@ -1431,9 +1478,9 @@ func (p *Player) UseItemOnEntity(e world.Entity) {
 // The damage dealt to the entity will depend on the item held by the player and any effects the player may
 // have.
 // If the player cannot reach the entity at its position, the method returns immediately.
-func (p *Player) AttackEntity(e world.Entity) {
+func (p *Player) AttackEntity(e world.Entity) bool {
 	if !p.canReach(e.Position()) {
-		return
+		return false
 	}
 	var (
 		force, height  = 0.45, 0.3608
@@ -1444,14 +1491,17 @@ func (p *Player) AttackEntity(e world.Entity) {
 
 	ctx := event.C()
 	if p.Handler().HandleAttackEntity(ctx, e, &force, &height, &critical); ctx.Cancelled() {
-		return
+		return false
 	}
 	p.SwingArm()
 
 	i, _ := p.HeldItems()
 	living, ok := e.(entity.Living)
-	if !ok || living.AttackImmune() {
-		return
+	if !ok {
+		return false
+	}
+	if living.AttackImmune() {
+		return true
 	}
 
 	dmg := i.AttackDamage()
@@ -1473,7 +1523,7 @@ func (p *Player) AttackEntity(e world.Entity) {
 
 	p.World().PlaySound(entity.EyePosition(e), sound.Attack{Damage: !mgl64.FloatEqual(n, 0)})
 	if !vulnerable {
-		return
+		return true
 	}
 	if critical {
 		for _, v := range p.World().Viewers(living.Position()) {
@@ -1499,6 +1549,7 @@ func (p *Player) AttackEntity(e world.Entity) {
 	if durable, ok := i.Item().(item.Durable); ok {
 		p.SetHeldItems(p.damageItem(i, durable.DurabilityInfo().AttackDurability), left)
 	}
+	return true
 }
 
 // StartBreaking makes the player start breaking the block at the position passed using the item currently
@@ -1727,7 +1778,7 @@ func (p *Player) BreakBlock(pos cube.Pos) {
 
 	if breakable, ok := b.(block.Breakable); ok && !p.GameMode().CreativeInventory() {
 		info := breakable.BreakInfo()
-		if diff := info.XPDrops[1] - info.XPDrops[0]; diff > 0 {
+		if diff := (info.XPDrops[1] - info.XPDrops[0]) + 1; diff > 0 {
 			amount := rand.Intn(diff) + info.XPDrops[0]
 			for _, orb := range entity.NewExperienceOrbs(pos.Vec3Centre(), amount) {
 				orb.SetVelocity(mgl64.Vec3{(rand.Float64()*0.2 - 0.1) * 2, rand.Float64() * 0.4, (rand.Float64()*0.2 - 0.1) * 2})
@@ -1970,6 +2021,16 @@ func (p *Player) Experience() int {
 	return p.experience.Experience()
 }
 
+// EnchantmentSeed is a seed used to calculate random enchantments with enchantment tables.
+func (p *Player) EnchantmentSeed() int64 {
+	return p.enchantSeed.Load()
+}
+
+// ResetEnchantmentSeed resets the enchantment seed to a new random value.
+func (p *Player) ResetEnchantmentSeed() {
+	p.enchantSeed.Store(rand.Int63())
+}
+
 // AddExperience adds experience to the player.
 func (p *Player) AddExperience(amount int) int {
 	ctx := event.C()
@@ -1989,7 +2050,7 @@ func (p *Player) AddExperience(amount int) int {
 
 // RemoveExperience removes experience from the player.
 func (p *Player) RemoveExperience(amount int) {
-	p.experience.Remove(amount)
+	p.experience.Add(-amount)
 	p.session().SendExperience(p.experience)
 }
 
@@ -2027,8 +2088,54 @@ func (p *Player) CollectExperience(value int) bool {
 	if time.Since(p.lastXPPickup.Load()) < time.Millisecond*100 {
 		return false
 	}
+	value = p.mendItems(value)
 	p.lastXPPickup.Store(time.Now())
-	return p.AddExperience(value) > 0
+	if value > 0 {
+		return p.AddExperience(value) > 0
+	}
+
+	p.PlaySound(sound.Experience{})
+	return true
+}
+
+// mendItems handles the mending enchantment when collecting experience, it then returns the leftover experience.
+func (p *Player) mendItems(xp int) int {
+	mendingItems := make([]item.Stack, 0, 6)
+	held, offHand := p.HeldItems()
+	if _, ok := offHand.Enchantment(enchantment.Mending{}); ok && offHand.Durability() < offHand.MaxDurability() {
+		mendingItems = append(mendingItems, offHand)
+	}
+	if _, ok := held.Enchantment(enchantment.Mending{}); ok && held.Durability() < held.MaxDurability() {
+		mendingItems = append(mendingItems, held)
+	}
+	for _, i := range p.Armour().Items() {
+		if i.Durability() == i.MaxDurability() {
+			continue
+		}
+		if _, ok := i.Enchantment(enchantment.Mending{}); ok {
+			mendingItems = append(mendingItems, i)
+		}
+	}
+	length := len(mendingItems)
+	if length == 0 {
+		return xp
+	}
+	foundItem := mendingItems[rand.Intn(length)]
+	repairAmount := math.Min(float64(foundItem.MaxDurability()-foundItem.Durability()), float64(xp*2))
+	repairedItem := foundItem.WithDurability(foundItem.Durability() + int(repairAmount))
+	if repairAmount >= 2 {
+		// Mending removes 1 experience point for every 2 durability points. If the repaired durability is less than 2,
+		// then no experience is removed.
+		xp -= int(math.Ceil(repairAmount / 2))
+	}
+	if offHand.Equal(foundItem) {
+		p.SetHeldItems(held, repairedItem)
+	} else if held.Equal(foundItem) {
+		p.SetHeldItems(repairedItem, offHand)
+	} else if slot, ok := p.Armour().Inventory().First(foundItem); ok {
+		_ = p.Armour().Inventory().SetItem(slot, repairedItem)
+	}
+	return xp
 }
 
 // Drop makes the player drop the item.Stack passed as an entity.Item, so that it may be picked up from the
@@ -2243,9 +2350,10 @@ func (p *Player) SetMaxAirSupply(duration time.Duration) {
 
 // canBreathe returns true if the player can currently breathe.
 func (p *Player) canBreathe(w *world.World) bool {
+	canTakeDamage := p.GameMode().AllowsTakingDamage()
 	_, waterBreathing := p.effects.Effect(effect.WaterBreathing{})
 	_, conduitPower := p.effects.Effect(effect.ConduitPower{})
-	return waterBreathing || conduitPower || !p.insideOfWater(w)
+	return !canTakeDamage || waterBreathing || conduitPower || (!p.insideOfWater(w) && !p.insideOfSolid(w))
 }
 
 // breathingDistanceBelowEyes is the lowest distance the player can be in water and still be able to breathe based on
@@ -2591,6 +2699,8 @@ func (p *Player) load(data Data) {
 	p.experience.Add(data.Experience)
 	p.session().SendExperience(p.experience)
 
+	p.enchantSeed.Store(data.EnchantmentSeed)
+
 	p.gameMode.Store(data.GameMode)
 	for _, potion := range data.Effects {
 		p.AddEffect(potion)
@@ -2599,6 +2709,9 @@ func (p *Player) load(data Data) {
 	p.fallDistance.Store(data.FallDistance)
 
 	p.loadInventory(data.Inventory)
+	for slot, stack := range data.EnderChestInventory {
+		_ = p.enderChest.SetItem(slot, stack)
+	}
 }
 
 // loadInventory loads all the data associated with the player inventory.
@@ -2630,6 +2743,7 @@ func (p *Player) Data() Data {
 		MaxHealth:       p.MaxHealth(),
 		Hunger:          p.hunger.foodLevel,
 		Experience:      p.Experience(),
+		EnchantmentSeed: p.EnchantmentSeed(),
 		FoodTick:        p.hunger.foodTick,
 		AirSupply:       p.airSupplyTicks.Load(),
 		MaxAirSupply:    p.maxAirSupplyTicks.Load(),
@@ -2645,10 +2759,11 @@ func (p *Player) Data() Data {
 			OffHand:      offHand,
 			MainHandSlot: p.heldSlot.Load(),
 		},
-		Effects:      p.Effects(),
-		FireTicks:    p.fireTicks.Load(),
-		FallDistance: p.fallDistance.Load(),
-		Dimension:    p.World().Dimension().EncodeDimension(),
+		EnderChestInventory: p.enderChest.Slots(),
+		Effects:             p.Effects(),
+		FireTicks:           p.fireTicks.Load(),
+		FallDistance:        p.fallDistance.Load(),
+		Dimension:           p.World().Dimension().EncodeDimension(),
 	}
 }
 

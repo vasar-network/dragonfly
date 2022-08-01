@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/df-mc/atomic"
+	"github.com/df-mc/dragonfly/server/block"
 	"github.com/df-mc/dragonfly/server/block/cube"
 	"github.com/df-mc/dragonfly/server/internal/sliceutil"
+	"github.com/df-mc/dragonfly/server/item"
 	"github.com/df-mc/dragonfly/server/item/inventory"
 	"github.com/df-mc/dragonfly/server/item/recipe"
 	"github.com/df-mc/dragonfly/server/player/chat"
@@ -57,9 +59,9 @@ type Session struct {
 	hiddenEntities   map[world.Entity]struct{}
 
 	// heldSlot is the slot in the inventory that the controllable is holding.
-	heldSlot         *atomic.Uint32
-	inv, offHand, ui *inventory.Inventory
-	armour           *inventory.Armour
+	heldSlot                     *atomic.Uint32
+	inv, offHand, enderChest, ui *inventory.Inventory
+	armour                       *inventory.Armour
 
 	breakingPos cube.Pos
 
@@ -147,10 +149,11 @@ func New(conn Conn, maxChunkRadius int, log Logger, joinMessage, quitMessage *at
 		_ = conn.WritePacket(&packet.ChunkRadiusUpdated{ChunkRadius: int32(r)})
 	}
 
-	s := &Session{
+	s := &Session{}
+	*s = Session{
 		openChunkTransactions:  make([]map[uint64]struct{}, 0, 8),
 		closeBackground:        make(chan struct{}),
-		ui:                     inventory.New(51, nil),
+		ui:                     inventory.New(53, s.handleInterfaceUpdate),
 		handlers:               map[uint32]packetHandler{},
 		entityRuntimeIDs:       map[world.Entity]uint64{},
 		entities:               map[uint64]world.Entity{},
@@ -235,6 +238,14 @@ func (s *Session) Close() error {
 func (s *Session) close() {
 	_ = s.c.Close()
 
+	// Move UI inventory items to the main inventory.
+	for _, it := range s.ui.Items() {
+		if _, err := s.inv.AddItem(it); err != nil {
+			// We couldn't add the item to the main inventory (probably because it was full), so we drop it instead.
+			s.c.Drop(it)
+		}
+	}
+
 	s.onStop(s.c)
 
 	// Clear the inventories so that they no longer hold references to the connection.
@@ -309,22 +320,6 @@ func (s *Session) handlePackets() {
 			return
 		}
 	}
-}
-
-// craftingSize gets the crafting size based on the opened container ID.
-func (s *Session) craftingSize() uint32 {
-	if s.openedContainerID.Load() == 1 {
-		return craftingGridSizeLarge
-	}
-	return craftingGridSizeSmall
-}
-
-// craftingOffset gets the crafting offset based on the opened container ID.
-func (s *Session) craftingOffset() uint32 {
-	if s.openedContainerID.Load() == 1 {
-		return craftingGridLargeOffset
-	}
-	return craftingGridSmallOffset
 }
 
 // background performs background tasks of the Session. This includes chunk sending and automatic command updating.
@@ -468,6 +463,18 @@ func (s *Session) registerHandlers() {
 	}
 }
 
+// handleInterfaceUpdate handles an update to the UI inventory, used for updating enchantment options and possibly more
+// in the future.
+func (s *Session) handleInterfaceUpdate(slot int, item item.Stack) {
+	if slot == enchantingInputSlot && s.containerOpened.Load() {
+		pos := s.openedPos.Load()
+		b := s.c.World().Block(pos)
+		if _, enchanting := b.(block.EnchantingTable); enchanting {
+			s.sendEnchantmentOptions(s.c.World(), pos, item)
+		}
+	}
+}
+
 // writePacket writes a packet to the session's connection if it is not Nop.
 func (s *Session) writePacket(pk packet.Packet) {
 	if s == Nop {
@@ -504,23 +511,21 @@ func (s *Session) closePlayerList() {
 	sessionMu.Unlock()
 }
 
+// actorIdentifier represents the structure of an actor identifier sent over the network.
+type actorIdentifier struct {
+	// ID is a unique namespaced identifier for the entity.
+	ID string `nbt:"id"`
+}
+
 // sendAvailableEntities sends all registered entities to the player.
 func (s *Session) sendAvailableEntities() {
-	// actorIdentifier represents the structure of an actor identifier sent over the network.
-	type actorIdentifier struct {
-		// Unique namespaced identifier for an entity.
-		ID string `nbt:"id"`
+	var identifiers []actorIdentifier
+	for _, entity := range world.Entities() {
+		identifiers = append(identifiers, actorIdentifier{ID: entity.EncodeEntity()})
 	}
-
-	entities := world.Entities()
-	var entityData []actorIdentifier
-	for _, entity := range entities {
-		id := entity.EncodeEntity()
-		entityData = append(entityData, actorIdentifier{ID: id})
-	}
-	serializedEntityData, err := nbt.Marshal(map[string]any{"idlist": entityData})
+	serializedEntityData, err := nbt.Marshal(map[string]any{"idlist": identifiers})
 	if err != nil {
-		panic(fmt.Errorf("failed to serialize entity data: %v", err))
+		panic("should never happen")
 	}
 	s.writePacket(&packet.AvailableActorIdentifiers{SerialisedEntityIdentifiers: serializedEntityData})
 }

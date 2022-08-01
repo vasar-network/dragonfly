@@ -19,6 +19,12 @@ func (ProjectileProtection) MaxLevel() int {
 	return 4
 }
 
+// Cost ...
+func (ProjectileProtection) Cost(level int) (int, int) {
+	min := 3 + (level-1)*6
+	return min, min + 6
+}
+
 // Rarity ...
 func (ProjectileProtection) Rarity() item.EnchantmentRarity {
 	return item.EnchantmentRarityUncommon
@@ -37,10 +43,10 @@ func (ProjectileProtection) Modifier() float64 {
 
 // CompatibleWithEnchantment ...
 func (ProjectileProtection) CompatibleWithEnchantment(t item.EnchantmentType) bool {
-	// TODO: Ensure that the armour does not have blast protection.
+	_, blastProtection := t.(BlastProtection)
 	_, fireProtection := t.(FireProtection)
 	_, protection := t.(Protection)
-	return !fireProtection && !protection
+	return !blastProtection && !fireProtection && !protection
 }
 
 // CompatibleWithItem ...
