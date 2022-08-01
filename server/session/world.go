@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"github.com/df-mc/dragonfly/server/block"
 	"github.com/df-mc/dragonfly/server/block/cube"
 	"github.com/df-mc/dragonfly/server/entity"
@@ -633,7 +634,7 @@ func (s *Session) ViewFurnaceUpdate(prevCookTime, cookTime, prevRemainingFuelTim
 
 // ViewBlockUpdate ...
 func (s *Session) ViewBlockUpdate(pos cube.Pos, b world.Block, layer int) {
-	blockPos := protocol.BlockPos{int32(pos[0]), int32(pos[1]), int32(pos[2])}
+	blockPos := blockPosToProtocol(pos)
 	s.writePacket(&packet.UpdateBlock{
 		Position:          blockPos,
 		NewBlockRuntimeID: world.BlockRuntimeID(b),
@@ -731,6 +732,15 @@ func (s *Session) ViewEntityState(e world.Entity) {
 	})
 }
 
+const (
+	containerTypeChest = iota
+	containerTypeCraftingTable
+	containerTypeAnvil     = 5
+	containerTypeDispenser = 6
+	containerTypeHopper    = 8
+	containerTypeBeacon    = 13
+)
+
 // OpenBlockContainer ...
 func (s *Session) OpenBlockContainer(pos cube.Pos) {
 	if s.containerOpened.Load() && s.openedPos.Load() == pos {
@@ -757,7 +767,7 @@ func (s *Session) OpenBlockContainer(pos cube.Pos) {
 	case block.EnchantingTable:
 		containerType = 3
 	case block.Anvil:
-		containerType = 5
+		containerType = containerTypeAnvil
 	case block.Beacon:
 		containerType = 13
 	case block.Stonecutter:
@@ -776,6 +786,69 @@ func (s *Session) OpenBlockContainer(pos cube.Pos) {
 		ContainerType:           containerType,
 		ContainerPosition:       protocol.BlockPos{int32(pos[0]), int32(pos[1]), int32(pos[2])},
 		ContainerEntityUniqueID: -1,
+	})
+}
+
+var (
+	// hopperBlockType is the block type used for displaying hopper inventories to sessions.
+	hopperBlockType, _ = world.BlockByName("minecraft:hopper", map[string]any{"facing_direction": int32(0), "toggle_bit": uint8(0)})
+	// dispenserBlockType is the block type used for displaying dispenser inventories to sessions.
+	dispenserBlockType, _ = world.BlockByName("minecraft:dispenser", map[string]any{"facing_direction": int32(0), "triggered_bit": uint8(0)})
+	// chestBlockType is the block type used for displaying chest inventories to sessions.
+	chestBlockType = block.Chest{}
+)
+
+// ViewInventory ...
+// TODO: Proper double-chest fake inventory support, cleanup.
+func (s *Session) ViewInventory(name string, inv *inventory.Inventory) {
+	var id string
+	var b world.Block
+	var containerID uint32
+	var containerType uint8
+	switch inv.Size() {
+	case inventory.HopperSize:
+		id, b, containerType, containerID = "Hopper", hopperBlockType, containerTypeHopper, containerChest
+	case inventory.DispenserSize:
+		id, b, containerType, containerID = "Dispenser", dispenserBlockType, containerTypeDispenser, containerChest
+	case inventory.ChestSize, inventory.DoubleChestSize:
+		id, b, containerType, containerID = "Chest", chestBlockType, containerTypeChest, containerChest
+	default:
+		panic(fmt.Errorf("cannot create fake inventory of size %d", inv.Size()))
+	}
+
+	pos := cube.PosFromVec3(entity.DirectionVector(s.c).Mul(-2).Add(s.c.Position()))
+
+	s.ViewBlockUpdate(pos, b, 0)
+	s.ViewBlockUpdate(pos.Add(cube.Pos{0, 1}), block.Air{}, 0)
+
+	blockPos := blockPosToProtocol(pos)
+	s.writePacket(&packet.BlockActorData{
+		Position: blockPos,
+		NBTData: map[string]interface{}{
+			"CustomName": name,
+			"id":         id,
+			"x":          blockPos.X(),
+			"y":          blockPos.Y(),
+			"z":          blockPos.Z(),
+		},
+	})
+
+	time.AfterFunc(time.Millisecond*50, func() {
+		s.openedPos.Store(pos)
+		s.openedWindow.Store(inv)
+
+		nextID := s.nextWindowID()
+		s.fakeInventoryOpen.Store(inv)
+		s.containerOpened.Store(true)
+		s.openedContainerID.Store(containerID)
+
+		s.writePacket(&packet.ContainerOpen{
+			WindowID:                nextID,
+			ContainerPosition:       blockPos,
+			ContainerType:           containerType,
+			ContainerEntityUniqueID: -1,
+		})
+		s.sendInv(inv, uint32(nextID))
 	})
 }
 
@@ -932,6 +1005,14 @@ func (s *Session) closeWindow() {
 	s.openedContainerID.Store(0)
 	s.openedWindow.Store(inventory.New(1, nil))
 	s.writePacket(&packet.ContainerClose{WindowID: byte(s.openedWindowID.Load())})
+	if inv := s.fakeInventoryOpen.Load(); inv != nil {
+		pos := s.openedPos.Load()
+		w := s.c.World()
+
+		inv.RemoveViewer(s)
+		s.ViewBlockUpdate(pos, w.Block(pos), 0)
+		s.ViewBlockUpdate(pos.Add(cube.Pos{0, 1}), w.Block(pos.Add(cube.Pos{0, 1})), 0)
+	}
 }
 
 // entityRuntimeID returns the runtime ID of the entity passed.
@@ -951,6 +1032,11 @@ func (s *Session) entityFromRuntimeID(id uint64) (world.Entity, bool) {
 	e, ok := s.entities[id]
 	s.entityMutex.RUnlock()
 	return e, ok
+}
+
+// blockPosToProtocl converts a cube.Pos to a protocol.BlockPos.
+func blockPosToProtocol(pos cube.Pos) protocol.BlockPos {
+	return protocol.BlockPos{int32(pos[0]), int32(pos[1]), int32(pos[2])}
 }
 
 // vec32To64 converts a mgl32.Vec3 to a mgl64.Vec3.

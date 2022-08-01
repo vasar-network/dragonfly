@@ -23,6 +23,17 @@ type Inventory struct {
 	canAdd func(s item.Stack, slot int) bool
 }
 
+const (
+	// HopperSize is a constant representing the size of a hopper inventory.
+	HopperSize = 5
+	// DispenserSize is a constant representing the size of a dispenser inventory.
+	DispenserSize = 9
+	// ChestSize is a constant representing the size of a chest inventory.
+	ChestSize = 27
+	// DoubleChestSize is a constant representing the size of a double chest inventory.
+	DoubleChestSize = 54
+)
+
 // ErrSlotOutOfRange is returned by any methods on inventory when a slot is passed which is not within the
 // range of valid values for the inventory.
 var ErrSlotOutOfRange = errors.New("slot is out of range: must be in range 0 <= slot < inventory.Size()")
